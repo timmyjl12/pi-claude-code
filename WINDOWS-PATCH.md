@@ -65,3 +65,13 @@ Pinned commits are never moved by pi updates. In
 
 then run `pi update --extensions` and restart pi. Trade-off: frozen at that
 commit — bump the SHA manually after rebasing the patch onto newer upstream.
+
+## Side effect while tracking upstream (banner false positive)
+
+While this patch is applied on top of upstream `main`, pi's startup check flags
+the package as having an update available every launch (it compares HEAD to the
+upstream tip by SHA, with no ancestry check). Do **not** run the suggested
+`pi update --extensions` — it wipes this patch. A fix for the banner is patched
+into pi's bundled CLI; see `PI-UPDATE-BANNER-FIX.md` and
+`C:\Users\timmy\.pi\patches\reapply-package-update-ancestor-check.ps1` (re-run
+that script after any pi upgrade).
