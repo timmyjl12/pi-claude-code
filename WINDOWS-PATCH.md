@@ -1,77 +1,96 @@
-# Windows patch — how to reapply after a pi update
+# Windows patch — status and workflow
 
-## The situation
+## Current setup: pi loads this clone directly
 
-Pi installs this extension from the **upstream** repo, because
-`~/.pi/agent/settings.json` contains:
+`~/.pi/agent/settings.json` points pi at the local clone, not upstream:
 
 ```json
-"https://github.com/earendil-works/pi-claude-code"
+"packages": [ "…", "D:\\dev_docs\\ai\\pi\\pi-claude-code" ]
 ```
 
-`pi update --extensions` (or a pi upgrade) reconciles that checkout back to
-upstream `main`, which **wipes our Windows patch** from:
+Per pi's package docs, a local package is **loaded from its resolved path without
+copying**, and pi never installs or modifies it. Consequences:
 
+- `pi update --extensions` and pi upgrades **cannot wipe this patch** — nothing
+  reconciles this directory to upstream.
+- No reapply step is needed after updates. No `pi update` nag for this package.
+- Pi reads the **working tree** live, so this clone must stay on the patched
+  branch with a clean tree. Switching branches or leaving edits changes the
+  running extension.
+
+The patch is committed on the fork:
+
+- Commit `39262cd44d82cb78cdff43f715eb9f6f40e4fd2b` — *fix: launch Windows
+  .cmd/.ps1 Claude Code shims with exact arguments*
+- Branch `fix/windows-cmd-ps1-launch`, merged into fork `main` as `dc17a63`
+- Its parent is upstream `main` tip `70abb65` — the patch sits directly on
+  current upstream, no rebase required.
+- Fork `main` is pushed to `origin` (`timmyjl12/pi-claude-code`).
+
+## What it does
+
+Launches Windows `.cmd`/`.bat` Claude Code shims through `cmd.exe` with a single
+cmd-escaped command line passed with `windowsVerbatimArguments`; runs `.ps1`
+shims via a noninteractive PowerShell host (`-EncodedCommand`,
+`PI_CLAUDE_CODE_POWERSHELL` override, `pwsh` preferred); surfaces real status
+diagnostics instead of a bogus login hint; reads `Path`/`ComSpec`
+case-insensitively.
+
+## Updating from upstream
+
+Keep `39262cd` on top of the new upstream tip:
+
+```powershell
+cd D:\dev_docs\ai\pi\pi-claude-code
+git fetch upstream                       # remote -> https://github.com/earendil-works/pi-claude-code
+git merge upstream/main                  # or: git rebase upstream/main
 ```
-~/.pi/agent/git/github.com/earendil-works/pi-claude-code
+
+Resolve any conflicts in `src/claude-cli.ts` / `src/provider.ts` by hand, then
+`git push origin main` and restart pi. If you rebased, the patch commit gets a
+new SHA — update this file and the notes in `PI-UPDATE-BANNER-FIX.md`.
+
+## Verify
+
+```powershell
+# Extension loaded? The provider is registered by this package.
+pi --list-models | Select-String claude-code
+
+# Patch present in the live tree?
+Select-String .\src\claude-cli.ts -Pattern windowsVerbatimArguments
 ```
 
-## The patch
+Tests need Node 22 (Node 26 dropped `--experimental-transform-types`; strip-only
+mode rejects TS parameter properties):
 
-- Branch in this fork: `fix/windows-cmd-ps1-launch`
-- Commit: `39262cd44d82cb78cdff43f715eb9f6f40e4fd2b`
-- Currently sits directly on top of upstream `main` (`70abb65`).
-- What it does: launches Windows `.cmd`/`.bat` Claude Code shims through
-  `cmd.exe` with a single cmd-escaped command line passed with
-  `windowsVerbatimArguments`, runs `.ps1` shims via a noninteractive
-  PowerShell host (`-EncodedCommand`, `PI_CLAUDE_CODE_POWERSHELL` override,
-  `pwsh` preferred), surfaces real status diagnostics instead of a bogus
-  login hint, and reads `Path`/`ComSpec` case-insensitively.
+```powershell
+& "$env:LOCALAPPDATA\nvs\node\22.20.0\x64\node.exe" --experimental-transform-types --test "tests/*.test.ts"
+```
 
-## Reapply (one command)
+`node_modules` in this package is only for dev/test. Host packages
+(`@earendil-works/*`) also live there but pi maps them to its own bundled
+copies at runtime — the same arrangement as your other local extensions, which
+carry older nested copies and run fine.
 
-From this repo clone:
+## Legacy: git package tracking upstream
+
+Only relevant if you revert the settings entry to
+`https://github.com/earendil-works/pi-claude-code`. In that mode pi manages a
+checkout at
+`~/.pi/agent/git/github.com/earendil-works/pi-claude-code`, and
+`pi update --extensions` reconciles it back to upstream `main`, wiping the
+patch. Restore with:
 
 ```powershell
 .\reapply-windows-patch.ps1
 ```
 
-Then **restart pi** (extensions are loaded at startup; no build step — pi
-loads `src/index.ts` directly).
+That directory still exists but is **orphaned** — pi no longer loads it. It is
+safe to delete when you are sure the local package setup is staying.
 
-## Reapply (manual)
-
-```powershell
-$p = "$env:USERPROFILE\.pi\agent\git\github.com\earendil-works\pi-claude-code"
-git -C $p fetch fork
-git -C $p merge --ff-only fork/fix/windows-cmd-ps1-launch
-```
-
-If the fast-forward fails because upstream `main` advanced and the checkout
-was reconciled past the patch's parent, rebase this fork's branch onto the
-new upstream `main`, push it, then run the script again (it falls back to a
-clean `reset --hard` to the branch tip — the checkout is a pi-managed cache
-and must be clean for the script to touch it).
-
-## Durable alternative (stops the wipe from happening)
-
-Point pi at this fork pinned to the patched commit instead of upstream.
-Pinned commits are never moved by pi updates. In
-`~/.pi/agent/settings.json`, replace the package entry with:
-
-```json
-"git:github.com/timmyjl12/pi-claude-code@39262cd44d82cb78cdff43f715eb9f6f40e4fd2b"
-```
-
-then run `pi update --extensions` and restart pi. Trade-off: frozen at that
-commit — bump the SHA manually after rebasing the patch onto newer upstream.
-
-## Side effect while tracking upstream (banner false positive)
-
-While this patch is applied on top of upstream `main`, pi's startup check flags
-the package as having an update available every launch (it compares HEAD to the
-upstream tip by SHA, with no ancestry check). Do **not** run the suggested
-`pi update --extensions` — it wipes this patch. A fix for the banner is patched
-into pi's bundled CLI; see `PI-UPDATE-BANNER-FIX.md` and
-`C:\Users\timmy\.pi\patches\reapply-package-update-ancestor-check.ps1` (re-run
-that script after any pi upgrade).
+While tracking upstream, pi's update check compares HEAD to the upstream tip by
+SHA with no ancestry check, so it flags a false "Package Updates Available" on
+every launch. The fix for that lives in pi's bundled CLI and must be reapplied
+after each pi upgrade — see `PI-UPDATE-BANNER-FIX.md` and
+`C:\Users\timmy\.pi\patches\reapply-package-update-ancestor-check.ps1`. It is
+irrelevant to the local-package setup, where no git check runs for this package.
