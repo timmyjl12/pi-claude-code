@@ -1,17 +1,18 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { closeClaudeProcesses } from "../src/claude-cli.ts";
 import { CLAUDE_CODE_MODELS } from "../src/model-catalog.ts";
 import { streamClaudeCode } from "../src/stream.ts";
+import { launchable } from "./fake-command.ts";
 
 test("hands Pi a tool call for a tool it never declared", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-claude-code-stream-"));
-  const executable = join(root, "fake-claude.mjs");
+  const script = join(root, "fake-claude.mjs");
   await writeFile(
-    executable,
+    script,
     `#!/usr/bin/env node
 import readline from "node:readline";
 if (process.argv.includes("auth") && process.argv.includes("status")) {
@@ -43,7 +44,7 @@ for await (const line of input) {
 `,
     "utf8",
   );
-  await chmod(executable, 0o755);
+  const executable = await launchable(script);
 
   try {
     const model = CLAUDE_CODE_MODELS.find((candidate) => candidate.id === "claude-opus-5-5")!;

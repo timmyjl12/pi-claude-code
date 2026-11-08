@@ -15,6 +15,7 @@ import {
 } from "../src/claude-cli.ts";
 import type { NativeFrame } from "../src/native-types.ts";
 import { createClaudeCodeProvider } from "../src/provider.ts";
+import { launchable } from "./fake-command.ts";
 
 type Block = Record<string, unknown>;
 type WireMessage = { role: string; content: unknown };
@@ -697,9 +698,9 @@ async function failingUpstreamTurn(
   }
 
   const root = await realpath(await mkdtemp(join(tmpdir(), "pi-claude-code-upstream-")));
-  const executable = join(root, "fake-claude.mjs");
+  const script = join(root, "fake-claude.mjs");
   await writeFile(
-    executable,
+    script,
     `#!/usr/bin/env node
 import readline from "node:readline";
 if (process.argv.includes("auth") && process.argv.includes("status")) {
@@ -724,7 +725,7 @@ for await (const line of input) {
 `,
     "utf8",
   );
-  await chmod(executable, 0o755);
+  const executable = await launchable(script);
 
   try {
     const error = await runClaudeRequest({
