@@ -5,8 +5,10 @@ import { join } from "node:path";
 import test from "node:test";
 
 // Exercise Pi's module aliases, not Node's direct package resolution.
+// Bracket access: the jiti test loader rewrites a literal `import.meta.resolve` into a helper it does not define.
+const resolveModule = (import.meta as unknown as Record<string, (specifier: string) => string>)["resolve"];
 const { loadExtensions } = await import(
-  new URL("./core/extensions/loader.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href
+  new URL("./core/extensions/loader.js", resolveModule("@earendil-works/pi-coding-agent")).href
 );
 
 test("loads an installed extension without local peer dependencies", async (t) => {

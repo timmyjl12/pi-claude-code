@@ -14,6 +14,7 @@ import {
   runClaudeRequest,
 } from "../src/claude-cli.ts";
 import { createClaudeCodeProvider } from "../src/provider.ts";
+import { launchable } from "./fake-command.ts";
 
 test("stabilizes Claude Code's native replay reminders and cache breakpoint", () => {
   const canonical = [{ type: "text", text: "inspect" }];
@@ -545,10 +546,10 @@ test("reports a dropped upstream stream as a retryable error", async () => {
   if (!address || typeof address === "string") throw new Error("missing address");
 
   const root = await realpath(await mkdtemp(join(tmpdir(), "pi-claude-code-drop-")));
-  const executable = join(root, "fake-claude.mjs");
+  const script = join(root, "fake-claude.mjs");
   // Like Claude Code: read the stream, then retry once natively before giving up.
   await writeFile(
-    executable,
+    script,
     `#!/usr/bin/env node
 import readline from "node:readline";
 if (process.argv.includes("auth") && process.argv.includes("status")) {
@@ -570,7 +571,7 @@ for await (const line of input) {
 `,
     "utf8",
   );
-  await chmod(executable, 0o755);
+  const executable = await launchable(script);
 
   try {
     const error = await runClaudeRequest({
