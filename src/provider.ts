@@ -1,5 +1,5 @@
 import { createProvider, type AuthContext, type ProviderEnv } from "@earendil-works/pi-ai";
-import { discoverClaudeModels, getClaudeStatus, LOGIN_HINT, POWERSHELL_ENV } from "./claude-cli.ts";
+import { discoverClaudeModelsShared, getClaudeStatusShared, LOGIN_HINT, POWERSHELL_ENV } from "./claude-cli.ts";
 import { API_ID, CLAUDE_CODE_MODELS, modelFromDiscovery, PROVIDER_ID } from "./model-catalog.ts";
 import { streamClaudeCode } from "./stream.ts";
 
@@ -52,7 +52,9 @@ export function createClaudeCodeProvider() {
         async check({ ctx, signal }) {
           const providerEnv = await providerEnvironment(ctx);
           lastProviderEnv = providerEnv;
-          const status = await getClaudeStatus(claudeCodeEnv(), signal);
+          // Pi checks availability from many places at once; share one probe and accept a recent
+          // failure so a logged-out or missing install is not re-probed in a burst.
+          const status = await getClaudeStatusShared(claudeCodeEnv(), signal, { acceptCachedFailure: true });
           // Only report the provider as configured when Claude Code is
           // installed and logged in, so Pi hides its models otherwise.
           if (!status.available || !status.loggedIn) return undefined;
@@ -85,7 +87,7 @@ export function createClaudeCodeProvider() {
           );
         },
         async refresh(_credential, signal) {
-          const status = await getClaudeStatus(claudeCodeEnv(), signal);
+          const status = await getClaudeStatusShared(claudeCodeEnv(), signal);
           if (!status.subscription) throw new Error(status.detail ?? LOGIN_HINT);
           return externalOAuthMarker();
         },
@@ -96,7 +98,7 @@ export function createClaudeCodeProvider() {
     },
     models: CLAUDE_CODE_MODELS,
     async fetchModels({ signal }) {
-      const models = (await discoverClaudeModels(claudeCodeEnv(), signal)).map(modelFromDiscovery);
+      const models = (await discoverClaudeModelsShared(claudeCodeEnv(), signal)).map(modelFromDiscovery);
       discoveredIds = new Set(models.map((model) => model.id));
       return models;
     },

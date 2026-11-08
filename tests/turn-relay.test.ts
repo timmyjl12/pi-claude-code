@@ -74,6 +74,8 @@ test("relays one upstream Messages request and captures its SSE response", async
     assert.deepEqual(observed.at(-1), "message_stop");
 
     relay.finishTurn();
+    assert.equal(relay.originalRequestBody, undefined);
+    assert.equal(relay.requestBody, undefined);
     const nextObserved: string[] = [];
     relay.beginTurn((event) => nextObserved.push(event.type));
     const next = await fetch(`${baseUrl}/v1/messages`, { method: "POST", body: '{"turn":2}' });
@@ -85,6 +87,93 @@ test("relays one upstream Messages request and captures its SSE response", async
     assert.equal(relay.denied, 0);
     assert.equal(relay.capture.complete, true);
     assert.equal(nextObserved.at(-1), "message_stop");
+  } finally {
+    await relay.close();
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
+  }
+});
+
+test("rejects declared and chunked bodies above 16 MiB without contacting upstream", async () => {
+  let upstreamRequests = 0;
+  const upstream = http.createServer((request, response) => {
+    upstreamRequests += 1;
+    response.writeHead(500).end();
+  });
+  const upstreamPort = await listen(upstream);
+  const relay = new TurnRelay(`http://127.0.0.1:${upstreamPort}`, 5_000);
+  const oversized = Buffer.alloc(16 * 1024 * 1024 + 1, 120);
+
+  try {
+    const baseUrl = await relay.start();
+    const target = new URL(`${baseUrl}/v1/messages`);
+    const chunkedStatus = await new Promise<number>((resolve, reject) => {
+      let settled = false;
+      const request = http.request(
+        {
+          hostname: target.hostname,
+          port: target.port,
+          path: target.pathname,
+          method: "POST",
+          headers: { "transfer-encoding": "chunked" },
+        },
+        (response) => {
+          settled = true;
+          response.resume();
+          resolve(response.statusCode ?? 0);
+        },
+      );
+      request.on("error", (error) => {
+        if (!settled) reject(error);
+      });
+      request.end(oversized);
+    });
+    assert.equal(chunkedStatus, 413);
+    await relay.settled();
+    assert.equal(upstreamRequests, 0);
+    assert.match(relay.failure ?? "", /exceeds 16777216 bytes/);
+
+    relay.finishTurn();
+    relay.beginTurn();
+    const declared = await fetch(target, { method: "POST", body: oversized });
+    assert.equal(declared.status, 413);
+    const payload = (await declared.json()) as { error?: { message?: string } };
+    assert.match(payload.error?.message ?? "", /exceeds 16777216 bytes/);
+    await relay.settled();
+    assert.equal(upstreamRequests, 0);
+    assert.equal(relay.originalRequestBody, undefined);
+    assert.equal(relay.requestBody, undefined);
+  } finally {
+    await relay.close();
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
+  }
+});
+
+test("releases request-body ownership at turn finish without duplicate unchanged buffers", async () => {
+  let receivedBytes = 0;
+  const upstream = http.createServer(async (request, response) => {
+    for await (const chunk of request) receivedBytes += chunk.length;
+    response.writeHead(200, { "content-type": "text/event-stream" }).end();
+  });
+  const upstreamPort = await listen(upstream);
+  const relay = new TurnRelay(`http://127.0.0.1:${upstreamPort}`, 5_000);
+
+  try {
+    const baseUrl = await relay.start();
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: "POST",
+      body: Buffer.alloc(2 * 1024 * 1024, 97),
+    });
+    assert.equal(response.status, 200);
+    await response.text();
+    await relay.settled();
+    assert.equal(receivedBytes, 2 * 1024 * 1024);
+    assert.equal(relay.originalRequestBody?.length, 2 * 1024 * 1024);
+    assert.strictEqual(relay.requestBody, relay.originalRequestBody);
+
+    relay.finishTurn();
+    assert.equal(relay.originalRequestBody, undefined);
+    assert.equal(relay.requestBody, undefined);
+    relay.finishTurn();
   } finally {
     await relay.close();
     await new Promise<void>((resolve) => upstream.close(() => resolve()));
