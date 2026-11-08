@@ -68,7 +68,7 @@ export function createClaudeCodeProvider() {
           const providerEnv = await providerEnvironment(ctx);
           lastProviderEnv = providerEnv;
           return {
-            auth: { apiKey: "external-process" },
+            auth: { apiKey: "external-process" }, // scan-allow: fixed placeholder; credentials stay in the external CLI
             env: providerEnv,
             source: "Claude Code CLI",
           };
@@ -92,7 +92,7 @@ export function createClaudeCodeProvider() {
           return externalOAuthMarker();
         },
         async toAuth() {
-          return { apiKey: "external-process" };
+          return { apiKey: "external-process" }; // scan-allow: fixed placeholder; credentials stay in the external CLI
         },
       },
     },
