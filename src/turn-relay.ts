@@ -110,6 +110,13 @@ const STRIPPED_REQUEST_HEADERS = new Set([
 ]);
 
 const STRIPPED_RESPONSE_HEADERS = new Set(["connection", "transfer-encoding", "server", "date"]);
+const MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024;
+
+class RequestBodyTooLargeError extends Error {
+  constructor() {
+    super(`Claude Code request body exceeds ${MAX_REQUEST_BODY_BYTES} bytes`);
+  }
+}
 
 export class TurnRelay {
   capture: AnthropicCapture;
@@ -184,6 +191,8 @@ export class TurnRelay {
 
   /** Disarm the current turn without closing the worker-scoped HTTP server. */
   finishTurn(): void {
+    this.originalRequestBody = undefined;
+    this.requestBody = undefined;
     if (this.cancelled) return;
     this.cancelled = true;
     for (const socket of this.sockets) socket.destroy(new Error("Claude Code request aborted"));
@@ -258,10 +267,10 @@ export class TurnRelay {
 
     let upstreamRequest: http.ClientRequest | undefined;
     try {
-      let body = await this.readBody(request);
-      this.originalRequestBody = Buffer.from(body);
-      if (this.transformRequest) body = this.transformRequest(body);
-      this.requestBody = Buffer.from(body);
+      const originalBody = await this.readBody(request);
+      this.originalRequestBody = originalBody;
+      const body = this.transformRequest?.(originalBody) ?? originalBody;
+      this.requestBody = body;
       if (this.cancelled) return;
 
       const headers: http.OutgoingHttpHeaders = {};
@@ -324,7 +333,20 @@ export class TurnRelay {
       response.end();
     } catch (error) {
       this.failure = error instanceof Error ? String(error) : "UnknownError";
-      if (!response.headersSent) response.writeHead(this.cancelled ? 499 : 502).end();
+      if (error instanceof RequestBodyTooLargeError && !response.headersSent) {
+        const body = Buffer.from(
+          JSON.stringify({
+            type: "error",
+            error: { type: "invalid_request_error", message: error.message },
+          }),
+        );
+        response.writeHead(413, {
+          "content-type": "application/json",
+          "content-length": body.length,
+        });
+        request.resume();
+        response.end(body);
+      } else if (!response.headersSent) response.writeHead(this.cancelled ? 499 : 502).end();
       else response.destroy();
     } finally {
       if (upstreamRequest) this.sockets.delete(upstreamRequest);
@@ -360,8 +382,52 @@ export class TurnRelay {
   }
 
   private async readBody(request: http.IncomingMessage): Promise<Buffer> {
+    const declaredLength = Number(request.headers["content-length"]);
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_REQUEST_BODY_BYTES) {
+      request.resume();
+      throw new RequestBodyTooLargeError();
+    }
+
     const chunks: Buffer[] = [];
-    for await (const rawChunk of request) chunks.push(Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk));
-    return Buffer.concat(chunks);
+    let length = 0;
+    return new Promise<Buffer>((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        request.off("data", onData);
+        request.off("end", onEnd);
+        request.off("error", onError);
+        request.off("aborted", onAborted);
+        request.off("close", onClose);
+      };
+      const onData = (rawChunk: Buffer) => {
+        if (settled) return;
+        if (length + rawChunk.length > MAX_REQUEST_BODY_BYTES) {
+          settled = true;
+          chunks.length = 0;
+          length = 0;
+          reject(new RequestBodyTooLargeError());
+          return;
+        }
+        chunks.push(rawChunk);
+        length += rawChunk.length;
+      };
+      const onEnd = () => {
+        if (!settled) resolve(chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks, length));
+        settled = true;
+        cleanup();
+      };
+      const onError = (error: Error) => {
+        if (!settled) reject(error);
+        settled = true;
+        cleanup();
+      };
+      const onAborted = () => onError(new Error("Claude Code request body was aborted"));
+      const onClose = () => onError(new Error("Claude Code request body connection closed"));
+      request.on("data", onData);
+      request.once("end", onEnd);
+      request.once("error", onError);
+      request.once("aborted", onAborted);
+      request.once("close", onClose);
+    });
   }
 }

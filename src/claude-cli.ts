@@ -273,6 +273,112 @@ export async function getClaudeStatus(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Shared, cached availability and catalog probes
+// ---------------------------------------------------------------------------
+// Pi asks a provider whether it is configured (`auth.check`) and for its model list (`fetchModels`)
+// from many places during startup and on every model refresh. Each answer used to start a fresh
+// Claude Code CLI process (a full Node start, roughly 0.5-0.8 s of CPU): 25 of them in one burst per
+// pi start, which also slowed everything else starting alongside. Concurrent callers now share one
+// in-flight probe and recent answers are reused. Request paths that need an authoritative answer
+// refuse cached failures, so logging in is noticed immediately where it matters.
+
+const STATUS_TTL_MS = 60_000;
+const STATUS_FAILURE_TTL_MS = 10_000;
+const DISCOVERY_TTL_MS = 30 * 60_000;
+const DISCOVERY_FAILURE_TTL_MS = 2 * 60_000;
+const MAX_PROBE_KEYS = 8;
+
+/** What makes two probes interchangeable: the same Claude Code installation and configuration. */
+function environmentKey(env: Record<string, string | undefined>): string {
+  return JSON.stringify([
+    configuredCommand(env),
+    envValue(env, "PATH"),
+    envValue(env, "HOME") ?? envValue(env, "USERPROFILE"),
+    env.CLAUDE_CONFIG_DIR,
+    envValue(env, POWERSHELL_ENV),
+  ]);
+}
+
+function remember<V>(map: Map<string, V>, key: string, value: V): void {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > MAX_PROBE_KEYS) {
+    const oldest = map.keys().next().value;
+    if (oldest === undefined) break;
+    map.delete(oldest);
+  }
+}
+
+/** Wait for shared work, but let this caller stop waiting without cancelling it for the others. */
+function untilSettledOrAborted<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return work;
+  signal.throwIfAborted();
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason ?? new DOMException("aborted", "AbortError"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    work.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+const statusCache = new Map<string, { status: ClaudeStatus; expires: number }>();
+const statusFlights = new Map<string, Promise<ClaudeStatus>>();
+const discoveryCache = new Map<string, { models?: DiscoveredClaudeModel[]; error?: unknown; expires: number }>();
+const discoveryFlights = new Map<string, Promise<DiscoveredClaudeModel[]>>();
+
+/** Forget every shared probe result (tests, and after the user changes their Claude Code setup). */
+export function resetClaudeProbeCaches(): void {
+  statusCache.clear();
+  statusFlights.clear();
+  discoveryCache.clear();
+  discoveryFlights.clear();
+}
+
+/**
+ * `getClaudeStatus` with a single in-flight probe per installation and a short result cache. A
+ * logged-in answer is reused for a minute; failures only for ten seconds and, unless the caller opts
+ * in with `acceptCachedFailure`, never: a request must see a fresh login immediately.
+ */
+export async function getClaudeStatusShared(
+  envInput: Record<string, string | undefined> = process.env,
+  signal?: AbortSignal,
+  options: { acceptCachedFailure?: boolean } = {},
+): Promise<ClaudeStatus> {
+  signal?.throwIfAborted();
+  const env = claudeEnvironment(envInput);
+  const key = environmentKey(env);
+  const cached = statusCache.get(key);
+  if (cached && cached.expires > Date.now()) {
+    const usable = cached.status.available && cached.status.loggedIn;
+    if (usable || options.acceptCachedFailure) return cached.status;
+  }
+  let flight = statusFlights.get(key);
+  if (!flight) {
+    // The shared probe is bounded by captureProcess's own timeout, not by any one caller's signal.
+    const started: Promise<ClaudeStatus> = getClaudeStatus(env).then((status) => {
+      const usable = status.available && status.loggedIn;
+      remember(statusCache, key, { status, expires: Date.now() + (usable ? STATUS_TTL_MS : STATUS_FAILURE_TTL_MS) });
+      return status;
+    });
+    flight = started;
+    statusFlights.set(key, started);
+    const settle = (): void => {
+      if (statusFlights.get(key) === started) statusFlights.delete(key);
+    };
+    started.then(settle, settle);
+  }
+  return untilSettledOrAborted(flight, signal);
+}
+
 const READY_STATUS_TTL_MS = 60_000;
 const readyStatusCache = new Map<string, { command: string; expires: number }>();
 
@@ -286,17 +392,11 @@ async function readyClaudeCommand(
   signal?: AbortSignal,
 ): Promise<string> {
   const env = claudeEnvironment(envInput);
-  const key = JSON.stringify([
-    configuredCommand(env),
-    envValue(env, "PATH"),
-    envValue(env, "HOME") ?? envValue(env, "USERPROFILE"),
-    env.CLAUDE_CONFIG_DIR,
-    envValue(env, POWERSHELL_ENV),
-  ]);
+  const key = environmentKey(env);
   const cached = readyStatusCache.get(key);
   if (cached && cached.expires > Date.now()) return cached.command;
 
-  const status = await getClaudeStatus(env, signal);
+  const status = await getClaudeStatusShared(env, signal);
   if (!status.available || !status.command) throw new Error(INSTALL_HINT);
   if (!status.loggedIn) {
     readyStatusCache.delete(key);
@@ -415,6 +515,44 @@ export async function discoverClaudeModels(
   }
 }
 
+/**
+ * `discoverClaudeModels` with one in-flight probe per installation and a long result cache: the
+ * catalog is a full Claude Code process start and changes rarely. A failure is remembered briefly so
+ * a broken installation is not re-probed on every refresh.
+ */
+export async function discoverClaudeModelsShared(
+  envInput: Record<string, string | undefined> = process.env,
+  signal?: AbortSignal,
+): Promise<DiscoveredClaudeModel[]> {
+  signal?.throwIfAborted();
+  const key = environmentKey(claudeEnvironment(envInput));
+  const cached = discoveryCache.get(key);
+  if (cached && cached.expires > Date.now()) {
+    if (cached.models) return cached.models;
+    throw cached.error;
+  }
+  let flight = discoveryFlights.get(key);
+  if (!flight) {
+    const started: Promise<DiscoveredClaudeModel[]> = discoverClaudeModels(envInput).then(
+      (models) => {
+        remember(discoveryCache, key, { models, expires: Date.now() + DISCOVERY_TTL_MS });
+        return models;
+      },
+      (error: unknown) => {
+        remember(discoveryCache, key, { error, expires: Date.now() + DISCOVERY_FAILURE_TTL_MS });
+        throw error;
+      },
+    );
+    flight = started;
+    discoveryFlights.set(key, started);
+    const settle = (): void => {
+      if (discoveryFlights.get(key) === started) discoveryFlights.delete(key);
+    };
+    started.then(settle, settle);
+  }
+  return untilSettledOrAborted(flight, signal);
+}
+
 // cmd.exe reparses the whole `/c` string, so tokens need cmd-level escaping in
 // addition to the quoting the receiving program's own command line parser
 // (CommandLineToArgvW) expects. The token rules below follow https://qntm.org/cmd.
@@ -507,53 +645,94 @@ export function killProcessTree(child: ChildProcess): void {
   }
 }
 
-class AsyncQueue<T> {
+interface QueueWaiter<T> {
+  resolve(value: T | undefined): void;
+  reject(reason: unknown): void;
+}
+
+/** Serial event consumer with one idle watchdog and one abort listener per turn. */
+export class AsyncQueue<T> {
   private readonly values: T[] = [];
-  private readonly waiters: Array<(value: IteratorResult<T>) => void> = [];
+  private waiter?: QueueWaiter<T>;
   private ended = false;
   private failure?: Error;
+  private idleTimer?: NodeJS.Timeout;
+  private timeoutMs?: number;
+  private signal?: AbortSignal;
+
+  private readonly onAbort = () => {
+    const reason = this.signal?.reason ?? new Error("Claude Code request aborted");
+    this.takeWaiter()?.reject(reason);
+  };
+
+  private readonly onIdleTimeout = () => {
+    this.takeWaiter()?.reject(new Error("Claude Code stream timed out"));
+  };
 
   push(value: T): void {
-    const waiter = this.waiters.shift();
-    if (waiter) waiter({ value, done: false });
+    const waiter = this.waiter;
+    this.waiter = undefined;
+    if (!this.ended) this.idleTimer?.refresh();
+    if (waiter) waiter.resolve(value);
     else this.values.push(value);
   }
 
   end(error?: Error): void {
     this.ended = true;
     this.failure = error;
-    for (const waiter of this.waiters.splice(0)) waiter({ value: undefined, done: true });
+    const waiter = this.takeWaiter();
+    if (error) waiter?.reject(error);
+    else waiter?.resolve(undefined);
+  }
+
+  /** Release per-turn resources without ending the worker-scoped stream. */
+  disarm(): void {
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = undefined;
+    this.timeoutMs = undefined;
+    this.signal?.removeEventListener("abort", this.onAbort);
+    this.signal = undefined;
   }
 
   async next(signal: AbortSignal | undefined, timeoutMs: number): Promise<T | undefined> {
-    if (this.values.length) return this.values.shift();
+    if (this.values.length) {
+      if (!this.ended) this.arm(signal, timeoutMs);
+      return this.values.shift();
+    }
     if (this.ended) {
+      this.disarm();
       if (this.failure) throw this.failure;
       return undefined;
     }
     signal?.throwIfAborted();
+    if (this.waiter) throw new Error("Claude Code stream supports one pending consumer");
 
+    this.arm(signal, timeoutMs);
     return new Promise<T | undefined>((resolve, reject) => {
-      let settled = false;
-      const finish = (fn: () => void) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        signal?.removeEventListener("abort", onAbort);
-        const index = this.waiters.indexOf(waiter);
-        if (index >= 0) this.waiters.splice(index, 1);
-        fn();
-      };
-      const waiter = (item: IteratorResult<T>) =>
-        finish(() => {
-          if (item.done && this.failure) reject(this.failure);
-          else resolve(item.done ? undefined : item.value);
-        });
-      const onAbort = () => finish(() => reject(signal?.reason ?? new Error("Claude Code request aborted")));
-      const timer = setTimeout(() => finish(() => reject(new Error("Claude Code stream timed out"))), timeoutMs);
-      this.waiters.push(waiter);
-      signal?.addEventListener("abort", onAbort, { once: true });
+      this.waiter = { resolve, reject };
     });
+  }
+
+  private arm(signal: AbortSignal | undefined, timeoutMs: number): void {
+    if (this.signal !== signal) {
+      this.signal?.removeEventListener("abort", this.onAbort);
+      this.signal = signal;
+      signal?.addEventListener("abort", this.onAbort, { once: true });
+    }
+    if (this.timeoutMs !== timeoutMs) {
+      if (this.idleTimer) clearTimeout(this.idleTimer);
+      this.idleTimer = undefined;
+      this.timeoutMs = timeoutMs;
+    }
+    if (this.idleTimer) this.idleTimer.refresh();
+    else this.idleTimer = setTimeout(this.onIdleTimeout, timeoutMs);
+  }
+
+  private takeWaiter(): QueueWaiter<T> | undefined {
+    const waiter = this.waiter;
+    this.waiter = undefined;
+    this.disarm();
+    return waiter;
   }
 }
 
@@ -860,13 +1039,55 @@ function digest(value: unknown): string {
   return createHash("sha256").update(canonicalJson(value)).digest("hex");
 }
 
-function frameHistoryHash(frames: NativeFrame[]): string {
-  return digest(
-    frames.map((frame) => ({
-      type: frame.type,
-      message: frame.message,
-    })),
-  );
+interface FrameHistoryState {
+  hash: ReturnType<typeof createHash>;
+  lastFrame?: NativeFrame;
+}
+
+/** Request-scoped incremental history digests; frames are immutable snapshots for one request. */
+export class FrameHistoryDigest {
+  private readonly histories = new WeakMap<NativeFrame[], Map<number, FrameHistoryState>>();
+
+  hash(frames: NativeFrame[], end = frames.length): string {
+    return this.finish(this.state(frames, end).hash);
+  }
+
+  append(frames: NativeFrame[], prefixEnd: number, suffix: NativeFrame[]): string {
+    const hash = this.state(frames, prefixEnd).hash.copy();
+    for (let index = 0; index < suffix.length; index++) {
+      this.update(hash, prefixEnd + index, suffix[index]!);
+    }
+    return this.finish(hash);
+  }
+
+  private state(frames: NativeFrame[], end: number): FrameHistoryState {
+    if (!Number.isInteger(end) || end < 0 || end > frames.length) throw new RangeError("Invalid frame history prefix");
+    let byLength = this.histories.get(frames);
+    if (!byLength) {
+      byLength = new Map();
+      this.histories.set(frames, byLength);
+    }
+    const exact = byLength.get(end);
+    if (exact && exact.lastFrame === frames[end - 1]) return exact;
+
+    const previous = byLength.get(end - 1);
+    const canAppend = previous && previous.lastFrame === frames[end - 2];
+    const hash = canAppend ? previous.hash.copy() : createHash("sha256").update("[");
+    const start = canAppend ? end - 1 : 0;
+    for (let index = start; index < end; index++) this.update(hash, index, frames[index]!);
+    const state = { hash, lastFrame: frames[end - 1] };
+    byLength.set(end, state);
+    return state;
+  }
+
+  private update(hash: ReturnType<typeof createHash>, index: number, frame: NativeFrame): void {
+    if (index > 0) hash.update(",");
+    hash.update(canonicalJson({ type: frame.type, message: frame.message }));
+  }
+
+  private finish(hash: ReturnType<typeof createHash>): string {
+    return hash.copy().update("]").digest("hex");
+  }
 }
 
 function launchPlan(input: RunClaudeInput): ClaudeLaunchPlan {
@@ -1020,9 +1241,9 @@ class ClaudeProcess {
     return now - this.createdAt >= CLAUDE_PROCESS_MAX_AGE_MS;
   }
 
-  canContinue(input: RunClaudeInput): boolean {
+  canContinue(input: RunClaudeInput, history: FrameHistoryDigest): boolean {
     if (!this.tipHash || input.frames.length === 0) return false;
-    return frameHistoryHash(input.frames.slice(0, -1)) === this.tipHash;
+    return history.hash(input.frames, input.frames.length - 1) === this.tipHash;
   }
 
   clearExpiryTimer(): void {
@@ -1039,7 +1260,7 @@ class ClaudeProcess {
     this.expiryTimer.unref?.();
   }
 
-  commit(input: RunClaudeInput, message: NativeMessage): boolean {
+  commit(input: RunClaudeInput, message: NativeMessage, history: FrameHistoryDigest): boolean {
     // Claude Code executes MCP calls internally before emitting its max-turns
     // result. Our inert MCP response is therefore part of its hidden history,
     // while Pi will append the real tool result. That state is not a faithful
@@ -1048,10 +1269,13 @@ class ClaudeProcess {
       this.tipHash = undefined;
       return false;
     }
-    this.tipHash = frameHistoryHash([
-      ...input.frames,
-      { type: "assistant", message: { role: "assistant", content: message.content } },
-    ]);
+    const assistant: NativeFrame = {
+      type: "assistant",
+      message: { role: "assistant", content: message.content },
+    };
+    const prefixEnd = Math.max(0, input.frames.length - 1);
+    const lastFrame = input.frames.at(-1);
+    this.tipHash = history.append(input.frames, prefixEnd, lastFrame ? [lastFrame, assistant] : [assistant]);
     return true;
   }
 
@@ -1205,6 +1429,7 @@ class ClaudeProcess {
       };
     } finally {
       input.signal?.removeEventListener("abort", abort);
+      this.queue.disarm();
       this.relay.finishTurn();
     }
   }
@@ -1212,7 +1437,12 @@ class ClaudeProcess {
   async close(): Promise<void> {
     this.closeNow();
     await Promise.allSettled([this.readTask, this.exitOutcome, this.relay.close()]);
-    await rm(this.root, { recursive: true, force: true });
+    try {
+      await rm(this.root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    } catch {
+      // Best-effort temp cleanup. On Windows a just-killed child can still hold a file (EBUSY/EPERM); close() is
+      // reached from fire-and-forget paths (idle expiry, session cleanup) where a rejection would end pi.
+    }
   }
 
   private closeNow(): void {
@@ -1238,7 +1468,29 @@ interface AcquiredProcess {
   sessionId?: string;
 }
 
+interface ProcessReservation {
+  cancelled: boolean;
+  worker?: ClaudeProcess;
+  settled: Promise<void>;
+  complete(worker?: ClaudeProcess): void;
+}
+
+function createProcessReservation(): ProcessReservation {
+  let settle!: () => void;
+  const settled = new Promise<void>((resolve) => (settle = resolve));
+  const reservation: ProcessReservation = {
+    cancelled: false,
+    settled,
+    complete: (worker) => {
+      reservation.worker = worker;
+      settle();
+    },
+  };
+  return reservation;
+}
+
 const processCache = new Map<string, ClaudeProcess>();
+const processReservations = new Map<string, ProcessReservation>();
 let managerTail: Promise<void> = Promise.resolve();
 
 async function withManagerLock<T>(operation: () => Promise<T> | T): Promise<T> {
@@ -1273,9 +1525,25 @@ async function discardProcess(acquired: AcquiredProcess): Promise<void> {
   await worker.close();
 }
 
-async function acquireProcess(input: RunClaudeInput, plan: ClaudeLaunchPlan): Promise<AcquiredProcess> {
-  return withManagerLock(async () => {
-    const sessionId = input.sessionId;
+function takeIdleCacheVictim(): ClaudeProcess | undefined {
+  const victim = [...processCache.entries()]
+    .filter(([, worker]) => !worker.busy)
+    .sort((left, right) => left[1].lastUsed - right[1].lastUsed)[0];
+  if (victim) processCache.delete(victim[0]);
+  return victim?.[1];
+}
+
+async function acquireProcess(
+  input: RunClaudeInput,
+  plan: ClaudeLaunchPlan,
+  history: FrameHistoryDigest,
+): Promise<AcquiredProcess> {
+  const sessionId = input.sessionId;
+  let reservation: ProcessReservation | undefined;
+  let retain = false;
+  const staleWorkers: ClaudeProcess[] = [];
+
+  const existing = await withManagerLock(() => {
     const cached = sessionId ? processCache.get(sessionId) : undefined;
     if (cached && !cached.busy) {
       cached.clearExpiryTimer();
@@ -1283,50 +1551,97 @@ async function acquireProcess(input: RunClaudeInput, plan: ClaudeLaunchPlan): Pr
         cached.isAlive() &&
         !cached.isExpired() &&
         cached.fingerprint === plan.fingerprint &&
-        cached.canContinue(input)
+        cached.canContinue(input, history)
       ) {
         cached.busy = true;
         return { worker: cached, retained: true, continuation: true, sessionId };
       }
       processCache.delete(sessionId!);
-      await cached.close();
+      staleWorkers.push(cached);
     }
 
-    // A concurrent request must not mutate the cached conversation. It gets a
-    // one-shot process, as does a request without Pi's stable session ID.
-    const retain = !!sessionId && !cached?.busy;
+    // Reserve cache ownership before any await. A concurrent request for the
+    // same session gets a one-shot worker and cannot mutate this conversation.
+    retain = !!sessionId && !cached?.busy && !processReservations.has(sessionId);
     if (retain) {
-      while (processCache.size >= MAX_CACHED_CLAUDE_PROCESSES) {
-        const victim = [...processCache.entries()]
-          .filter(([, worker]) => !worker.busy)
-          .sort((left, right) => left[1].lastUsed - right[1].lastUsed)[0];
-        if (!victim) break;
-        processCache.delete(victim[0]);
-        await victim[1].close();
-      }
+      reservation = createProcessReservation();
+      processReservations.set(sessionId!, reservation);
     }
-
-    const worker = await ClaudeProcess.create(input, plan);
-    worker.busy = true;
-    const retained = retain && processCache.size < MAX_CACHED_CLAUDE_PROCESSES;
-    if (retained) processCache.set(sessionId!, worker);
-    return { worker, retained, continuation: false, sessionId };
+    return undefined;
   });
+  if (existing) return existing;
+
+  let worker: ClaudeProcess;
+  try {
+    await Promise.all(staleWorkers.map((worker) => worker.close()));
+    // Authentication, temporary files, relay startup and process creation are
+    // deliberately outside the global manager mutex.
+    worker = await ClaudeProcess.create(input, plan);
+  } catch (error) {
+    if (sessionId && reservation) {
+      await withManagerLock(() => {
+        if (processReservations.get(sessionId) === reservation) processReservations.delete(sessionId);
+      });
+      reservation.complete();
+    }
+    throw error;
+  }
+
+  worker.busy = true;
+  const evictedWorkers: ClaudeProcess[] = [];
+  const retained = await withManagerLock(() => {
+    const ownsReservation =
+      !!sessionId &&
+      !!reservation &&
+      !reservation.cancelled &&
+      processReservations.get(sessionId) === reservation;
+    if (sessionId && ownsReservation) processReservations.delete(sessionId);
+    if (!retain || !ownsReservation) return false;
+
+    while (processCache.size >= MAX_CACHED_CLAUDE_PROCESSES) {
+      const victim = takeIdleCacheVictim();
+      if (!victim) break;
+      evictedWorkers.push(victim);
+    }
+    if (processCache.size >= MAX_CACHED_CLAUDE_PROCESSES) return false;
+    processCache.set(sessionId!, worker);
+    return true;
+  });
+  reservation?.complete(worker);
+  try {
+    await Promise.all(evictedWorkers.map((worker) => worker.close()));
+  } catch (error) {
+    await Promise.allSettled([discardProcess({ worker, retained, continuation: false, sessionId })]);
+    throw error;
+  }
+  return { worker, retained, continuation: false, sessionId };
 }
 
 /** Close warm Claude processes for one Pi session, or all sessions. */
 export async function closeClaudeProcesses(sessionId?: string): Promise<void> {
-  const workers = await withManagerLock(() => {
+  const { workers, reservations } = await withManagerLock(() => {
+    const reservations = sessionId
+      ? [processReservations.get(sessionId)].filter((value): value is ProcessReservation => !!value)
+      : [...processReservations.values()];
+    for (const reservation of reservations) reservation.cancelled = true;
     if (sessionId) {
       const worker = processCache.get(sessionId);
       processCache.delete(sessionId);
-      return worker ? [worker] : [];
+      processReservations.delete(sessionId);
+      return { workers: worker ? [worker] : [], reservations };
     }
-    const all = [...processCache.values()];
+    const workers = [...processCache.values()];
     processCache.clear();
-    return all;
+    processReservations.clear();
+    return { workers, reservations };
   });
-  await Promise.allSettled(workers.map((worker) => worker.close()));
+  await Promise.allSettled([
+    ...workers.map((worker) => worker.close()),
+    ...reservations.map(async (reservation) => {
+      await reservation.settled;
+      await reservation.worker?.close();
+    }),
+  ]);
 }
 
 /** Test/debug visibility without exposing child processes themselves. */
@@ -1341,10 +1656,11 @@ registerSessionResourceCleanup((sessionId) => {
 export async function runClaudeRequest(input: RunClaudeInput): Promise<RunClaudeOutput> {
   input.signal?.throwIfAborted();
   const plan = launchPlan(input);
-  const acquired = await acquireProcess(input, plan);
+  const history = new FrameHistoryDigest();
+  const acquired = await acquireProcess(input, plan, history);
   try {
     const output = await acquired.worker.run(input, acquired.continuation);
-    const stable = acquired.worker.commit(input, output.message);
+    const stable = acquired.worker.commit(input, output.message, history);
     if (
       stable &&
       acquired.retained &&
