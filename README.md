@@ -41,6 +41,13 @@ execution. Claude Code only talks to the model. It never runs tools itself.
 pi install https://github.com/earendil-works/pi-claude-code
 ```
 
+This fork (Windows launch fixes, shared status probes, bounded process lifecycle, rebased on upstream `main`) is
+published as `@timmyjl12/pi-claude-code`:
+
+```sh
+pi install npm:@timmyjl12/pi-claude-code
+```
+
 Then pick a model from the **Claude Code Subscription (Experimental)** provider
 in Pi.
 
