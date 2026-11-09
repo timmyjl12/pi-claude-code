@@ -17,6 +17,8 @@ const SAFETY_FLAGS = [
   "DISABLE_FEEDBACK_COMMAND",
   "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL",
   "DISABLE_ERROR_REPORTING",
+  // The discovery process shares Pi's terminal and must not retitle it.
+  "CLAUDE_CODE_DISABLE_TERMINAL_TITLE",
 ] as const;
 
 test("model discovery allows the served catalog while preserving explicit privacy choices", async (t) => {

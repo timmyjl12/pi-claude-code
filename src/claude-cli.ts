@@ -161,6 +161,8 @@ function claudeEnvironment(env: Record<string, string | undefined>): Record<stri
   }
   const configDir = envValue(output, "PI_CLAUDE_CODE_CONFIG_DIR");
   if (configDir) output.CLAUDE_CONFIG_DIR = configDir;
+  // Every Claude Code child shares Pi's terminal, whose title belongs to Pi.
+  output.CLAUDE_CODE_DISABLE_TERMINAL_TITLE = "1";
   return output;
 }
 

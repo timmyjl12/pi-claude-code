@@ -371,6 +371,8 @@ test("runs a request through a stream-json Claude executable with an inherited A
 import readline from "node:readline";
 import {appendFileSync, readFileSync} from "node:fs";
 if ("ANTHROPIC_API_KEY" in process.env) throw new Error("API key leaked to Claude child");
+// Checked before the status branch: status probes share Pi's terminal too.
+if (process.env.CLAUDE_CODE_DISABLE_TERMINAL_TITLE !== "1") throw new Error("Claude child may overwrite the terminal title");
 if (process.argv.includes("auth") && process.argv.includes("status")) {
   console.log(JSON.stringify({loggedIn: true, authMethod: "claude.ai", subscriptionType: "test"}));
   process.exit(0);
