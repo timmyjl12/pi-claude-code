@@ -16,6 +16,8 @@ export interface DiscoveredClaudeModel {
   supportsAdaptiveThinking?: boolean;
   supportsFastMode?: boolean;
   supportsAutoMode?: boolean;
+  /** Reported by newer Claude Code versions: whether `thinking: { type: "disabled" }` is accepted. */
+  supportsThinkingOff?: boolean;
 }
 
 // Pi exposes providers/all to extensions, but not individual generated model files.
@@ -51,6 +53,18 @@ const FALLBACK_DISCOVERY: DiscoveredClaudeModel[] = [
     supportsAutoMode: true,
   },
   {
+    value: "fable",
+    resolvedModel: "claude-fable-5-2",
+    displayName: "Fable 5.2",
+    description: "For your toughest challenges",
+    supportsEffort: true,
+    supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"],
+    supportsAdaptiveThinking: true,
+    supportsFastMode: true,
+    supportsAutoMode: true,
+    supportsThinkingOff: false,
+  },
+  {
     value: "claude-fable-5-1[1m]",
     resolvedModel: "claude-fable-5-1",
     displayName: "Fable",
@@ -83,8 +97,34 @@ const ALIASES: Record<string, string> = {
   haiku: "claude-haiku-4-5-20251001",
   "claude-haiku-4-5": "claude-haiku-4-5-20251001",
   opus: "claude-opus-5-5",
-  fable: "claude-fable-5-1",
+  fable: "claude-fable-5-2",
 };
+
+const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+
+/**
+ * The newest built-in model of the same family and major version that precedes `id`, for example
+ * `claude-fable-5-1` for `claude-fable-5-2`. Claude Code can offer a point release before Pi's
+ * catalog lists it; its predecessor is a far better capability estimate than generic defaults.
+ */
+function precedingBuiltin(id: string): Model<"anthropic-messages"> | undefined {
+  const match = /^(claude-[a-z]+-\d+)-(\d{1,2})$/u.exec(id);
+  if (!match) return undefined;
+  const family = match[1]!;
+  const minor = Number(match[2]);
+  let best: { minor: number; model: Model<"anthropic-messages"> } | undefined;
+  for (const [candidateId, model] of Object.entries(BUILTIN_ANTHROPIC_MODELS)) {
+    let candidateMinor: number;
+    if (candidateId === family) candidateMinor = 0;
+    else {
+      const candidate = /^(claude-[a-z]+-\d+)-(\d{1,2})$/u.exec(candidateId);
+      if (candidate?.[1] !== family) continue;
+      candidateMinor = Number(candidate[2]);
+    }
+    if (candidateMinor < minor && (!best || candidateMinor > best.minor)) best = { minor: candidateMinor, model };
+  }
+  return best?.model;
+}
 
 function withoutContextSuffix(model: string): string {
   return model.replace(/\[1m\]$/u, "");
@@ -109,8 +149,11 @@ function fallbackModel(info: DiscoveredClaudeModel, id: string): ClaudeCodeModel
     reasoning: info.supportsAdaptiveThinking === true || info.supportsEffort === true,
     ...(thinkingLevelMap ? { thinkingLevelMap } : {}),
     input: ["text", "image"],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: /\b1M context\b/iu.test(info.description) ? 1_000_000 : 200_000,
+    cost: { ...ZERO_COST },
+    contextWindow:
+      /\b1M context\b/iu.test(info.description) || /\[1m\]$/u.test(info.value) || /\[1m\]$/u.test(info.resolvedModel ?? "")
+        ? 1_000_000
+        : 200_000,
     maxTokens: 64_000,
   };
 }
@@ -133,21 +176,39 @@ function fromBuiltin(info: DiscoveredClaudeModel, id: string, builtin: Model<"an
   };
 }
 
+/** Limits and capabilities of the preceding release; pricing is not assumed to carry over. */
+function fromPredecessor(
+  info: DiscoveredClaudeModel,
+  id: string,
+  predecessor: Model<"anthropic-messages">,
+): ClaudeCodeModel {
+  return {
+    ...fromBuiltin(info, id, predecessor),
+    name: `${info.displayName} (Claude Code)`,
+    cost: { ...ZERO_COST },
+  };
+}
+
 /** Convert a Claude Code catalog row into Pi's built-in Anthropic naming and pricing. */
 export function modelFromDiscovery(info: DiscoveredClaudeModel): ClaudeCodeModel {
   const id = canonicalModelId(info);
   const builtinId = id === "default" ? withoutContextSuffix(info.resolvedModel || "") : id;
   const builtin = BUILTIN_ANTHROPIC_MODELS[builtinId];
+  const predecessor = builtin ? undefined : precedingBuiltin(builtinId);
+  const known = builtin ?? predecessor;
   NATIVE_ROUTE_BY_ID.set(id, info.value);
-  NATIVE_TOOL_CHANGES_BY_ID.set(id, builtin?.compat?.supportsMidConvoToolChanges === true);
+  NATIVE_TOOL_CHANGES_BY_ID.set(id, known?.compat?.supportsMidConvoToolChanges === true);
   ADAPTIVE_THINKING_BY_ID.set(id, info.supportsAdaptiveThinking === true);
   DISABLED_THINKING_BY_ID.set(
     id,
     // Pi marks models that reject `thinking.type: disabled` with `off: null`. Unknown
     // adaptive models are assumed to be newer and therefore unable to disable thinking.
-    builtin ? builtin.thinkingLevelMap?.off !== null : info.supportsAdaptiveThinking !== true,
+    // Claude Code's own answer, when it gives one, is authoritative for the installed version.
+    info.supportsThinkingOff ??
+      (known ? known.thinkingLevelMap?.off !== null : info.supportsAdaptiveThinking !== true),
   );
-  return builtin ? fromBuiltin(info, id, builtin) : fallbackModel(info, id);
+  if (builtin) return fromBuiltin(info, id, builtin);
+  return predecessor ? fromPredecessor(info, id, predecessor) : fallbackModel(info, id);
 }
 
 export const CLAUDE_CODE_MODELS: ClaudeCodeModel[] = FALLBACK_DISCOVERY.map(modelFromDiscovery);
