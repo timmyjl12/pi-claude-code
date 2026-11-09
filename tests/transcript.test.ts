@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { AssistantMessage, Message, Model, Tool } from "@earendil-works/pi-ai";
+import { modelFromDiscovery } from "../src/model-catalog.ts";
 import {
   buildExtraBody,
   getInitialSystemMessages,
@@ -222,13 +223,23 @@ test("normalizes tool schemas and builds native generation fields", () => {
     context_management: { edits: [] },
   });
   // Opus 5.5 rejects `thinking.type: disabled` (issue #2).
-  for (const id of ["claude-opus-5-5", "default", "claude-fable-5-1"]) {
+  for (const id of ["claude-opus-5-5", "default", "claude-fable-5-1", "claude-fable-5-2"]) {
     assert.deepEqual(buildExtraBody(id, [], {}), {
       tools: [],
       thinking: { type: "adaptive" },
       output_config: { effort: "low" },
     });
   }
+  // A model that can neither disable thinking nor think adaptively gets no thinking field.
+  modelFromDiscovery({
+    value: "claude-nomode-1",
+    resolvedModel: "claude-nomode-1",
+    displayName: "No mode",
+    description: "Test model",
+    supportsAdaptiveThinking: false,
+    supportsThinkingOff: false,
+  });
+  assert.deepEqual(buildExtraBody("claude-nomode-1", [], {}), { tools: [] });
 });
 
 test("keeps native replay only for the same model without changing the source history", () => {

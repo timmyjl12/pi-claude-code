@@ -402,8 +402,11 @@ export function buildExtraBody(
     };
   } else if (!supportsDisabledThinking(modelId)) {
     // Models such as Opus 5.5 reject `disabled`; use the lowest adaptive effort instead.
-    body.thinking = { type: "adaptive" };
-    body.output_config = { effort: "low" };
+    // A model that reports neither mode gets no thinking field and keeps its own default.
+    if (supportsAdaptiveThinking(modelId)) {
+      body.thinking = { type: "adaptive" };
+      body.output_config = { effort: "low" };
+    }
   } else {
     body.thinking = { type: "disabled" };
     // Native clear-thinking edits are invalid when thinking is disabled.
