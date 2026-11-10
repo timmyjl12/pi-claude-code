@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 import {
   CLAUDE_CODE_MODELS,
   modelFromDiscovery,
@@ -76,26 +77,35 @@ test("maps discovered aliases to stable canonical Pi model ids", () => {
 });
 
 test("a point release missing from Pi's catalog inherits its predecessor's limits", () => {
-  // The row Claude Code 2.1.321 reports for Fable 5.2: no "1M context" text and no [1m] suffix.
+  // The release is derived from the installed catalog (one past its newest Fable 5.x), so this keeps testing
+  // "not in the catalog yet" after Pi adds a release. A fixed id stopped doing that when Pi 1.5.1 added Fable 5.2.
+  const newest = getBuiltinModels("anthropic")
+    .map((model) => ({ model, minor: /^claude-fable-5-(\d{1,2})$/u.exec(model.id)?.[1] }))
+    .filter((entry): entry is { model: (typeof entry)["model"]; minor: string } => entry.minor !== undefined)
+    .sort((left, right) => Number(right.minor) - Number(left.minor))[0];
+  assert.ok(newest, "the installed catalog lists a Fable 5.x release");
+  const next = Number(newest.minor) + 1;
+  const id = `claude-fable-5-${next}`;
+  // The row shape Claude Code reports for a new point release: no "1M context" text and no [1m] suffix.
   const fable = modelFromDiscovery({
     value: "fable",
-    resolvedModel: "claude-fable-5-2",
-    displayName: "Fable 5.2",
+    resolvedModel: id,
+    displayName: `Fable 5.${next}`,
     description: "For your toughest challenges",
     supportsEffort: true,
     supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"],
     supportsAdaptiveThinking: true,
     supportsThinkingOff: false,
   });
-  assert.equal(fable.id, "claude-fable-5-2");
-  assert.equal(fable.name, "Fable 5.2 (Claude Code)");
-  assert.equal(fable.contextWindow, 1_000_000);
-  assert.equal(fable.maxTokens, 128_000);
+  assert.equal(fable.id, id);
+  assert.equal(fable.name, `Fable 5.${next} (Claude Code)`);
+  assert.equal(fable.contextWindow, newest.model.contextWindow);
+  assert.equal(fable.maxTokens, newest.model.maxTokens);
   assert.equal(fable.thinkingLevelMap?.off, null);
   // Pricing is not assumed to carry over between releases.
   assert.deepEqual(fable.cost, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
-  assert.equal(supportsNativeToolChanges("claude-fable-5-2"), true);
-  assert.equal(supportsDisabledThinking("claude-fable-5-2"), false);
+  assert.equal(supportsNativeToolChanges(id), newest.model.compat?.supportsMidConvoToolChanges === true);
+  assert.equal(supportsDisabledThinking(id), false);
 });
 
 test("Claude Code's supportsThinkingOff overrides the catalog's guess", () => {

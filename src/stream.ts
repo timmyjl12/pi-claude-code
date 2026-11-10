@@ -383,7 +383,11 @@ export function streamClaudeCode(
         initialSystemMessages,
         nativeSystemInjections: nativeTranscript?.systemInjections,
         betas: nativeTranscript ? [NATIVE_TOOL_CHANGES_BETA] : undefined,
-        sessionId: options?.cacheRetention === "none" ? undefined : options?.sessionId,
+        // A replay that must not touch continuation state (Pi's cache warming: the last request again, capped at
+        // one output token) runs on a one-shot process. Its output cap changes the launch fingerprint, so in the
+        // session's slot it would close the retained process and leave the next real turn to start another.
+        sessionId:
+          options?.cacheRetention === "none" || options?.disableContinuation ? undefined : options?.sessionId,
         onEvent: (event) => translator.event(event),
       });
       translator.finish(response.message, response.usage, response.initialSystemMessages);
